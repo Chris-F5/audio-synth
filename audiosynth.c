@@ -6,68 +6,108 @@
 
 #include <portaudio.h>
 
+#include "linked_list.h"
+
 #define PI 3.14159265
 
 #define SAMPLE_RATE 44100
-#define CONCURRENT_INSTRUMENT_COUNT 16
-#define CONCURRENT_NOTE_COUNT 3
+#define FRAME_LEN 128
+#define BPM 120
+#define BEAT_LEN ((uint32_t)((double)60 / (double)BPM * SAMPLE_RATE))
 
-struct Instrument {
-    uint32_t attack;
-    uint32_t decay;
+struct ChannelState {
+    uint32_t waveOffset;
+    uint16_t freq;
+    double cAmp;
+    double tAmp;
 };
 
-struct Note {
-    float freq;
-    float amp;
-    uint32_t sustain;
+#define CHANNEL_MOD_TYPE_NOOP 0x00
+#define CHANNEL_MOD_TYPE_FREQ 0x01
+#define CHANNEL_MOD_TYPE_AMP 0x02
+
+struct ChannelMod {
+    uint8_t type;
+    uint16_t value;
 };
 
-struct AudioData {
+struct ChannelFrame {
+    struct LinkedListNode* mods[FRAME_LEN];
+};
+
+struct AudioStreamData {
     uint32_t t;
-
-    float amp;
-
-    struct Instrument noteInstruments[CONCURRENT_INSTRUMENT_COUNT];
-
-    bool noteMask[CONCURRENT_INSTRUMENT_COUNT][CONCURRENT_NOTE_COUNT];
-    struct Note notes[CONCURRENT_INSTRUMENT_COUNT][CONCURRENT_NOTE_COUNT];
-    uint32_t noteTimes[CONCURRENT_INSTRUMENT_COUNT][CONCURRENT_NOTE_COUNT];
-    bool playNowNotes[CONCURRENT_INSTRUMENT_COUNT][CONCURRENT_NOTE_COUNT];
+    double amp;
+    struct ChannelState channelState;
+    struct ChannelFrame frame;
 };
 
-void AudioData_init(struct AudioData* data)
+static struct AudioStreamData audioStreamData;
+
+static void ChannelFrame_init(struct ChannelFrame* frame)
 {
-    data->t = 0;
-    data->amp = 1.0f;
-    for (uint32_t i = 0; i < CONCURRENT_INSTRUMENT_COUNT * CONCURRENT_NOTE_COUNT; i++)
-        data->noteMask[0][i] = false;
+    for (unsigned int i = 0; i < FRAME_LEN; i++)
+        frame->mods[i] = NULL;
 }
 
-void AudioData_playNote(
-    struct AudioData* data,
-    uint32_t insId,
-    uint32_t noteTime,
-    bool playNow,
-    struct Note* note)
+static void ChannelState_default(struct ChannelState* state)
 {
-    uint32_t noteId;
-    for (noteId = 0; noteId < CONCURRENT_NOTE_COUNT; noteId++) {
-        if (data->noteMask[insId][noteId] == false) {
-            printf("%d\n", noteId);
-            break;
-        } else if (noteId == CONCURRENT_NOTE_COUNT - 1) {
-            puts("cant play this note. exiting");
-            exit(1);
-        }
+    state->waveOffset = 0;
+    state->freq = 1;
+    state->cAmp = 0.0;
+    state->tAmp = 0.0;
+}
+
+static double ChannelState_sample(struct ChannelState* state, uint32_t t)
+{
+    /* ATTACK*/
+    if (t % 10 == 0) {
+        if (state->tAmp > state->cAmp)
+            state->cAmp += 0.01;
+        if (state->tAmp < state->cAmp)
+            state->cAmp -= 0.01;
     }
-    data->noteMask[insId][noteId] = true;
-    data->notes[insId][noteId] = *note;
-    data->noteTimes[insId][noteId] = noteTime;
-    data->playNowNotes[insId][noteId] = playNow;
+
+    /* WAVE */
+    state->waveOffset += state->freq;
+    state->waveOffset = state->waveOffset % SAMPLE_RATE;
+    double v;
+    v = sin(
+        ((double)state->waveOffset / (double)SAMPLE_RATE)
+        * 2 * PI);
+
+    /* AMPLITUDE */
+    v *= state->cAmp;
+
+    return v;
 }
 
-static struct AudioData paStreamData;
+static void modChannelState(struct ChannelState* state, struct ChannelMod* mod, uint32_t t)
+{
+    switch (mod->type) {
+    case CHANNEL_MOD_TYPE_NOOP:
+        break;
+    case CHANNEL_MOD_TYPE_FREQ:
+        state->freq = mod->value;
+        break;
+    case CHANNEL_MOD_TYPE_AMP:
+        state->tAmp = (double)mod->value / (double)UINT16_MAX;
+        break;
+    default:
+        break;
+    }
+}
+
+static void nextBeat(struct AudioStreamData* d, uint32_t t)
+{
+    uint32_t beat = d->t / BEAT_LEN;
+    printf("%d\n", beat);
+    struct LinkedListNode* node = d->frame.mods[beat];
+    while(node != NULL) {
+        modChannelState(&d->channelState, node->data, t);
+        node = node->next;
+    }
+}
 
 static int callback(
     const void* input,
@@ -77,47 +117,15 @@ static int callback(
     PaStreamCallbackFlags statusFlags,
     void* userData)
 {
-    struct AudioData* audioData = (struct AudioData*)userData;
+    struct AudioStreamData* d = (struct AudioStreamData*)userData;
     float* out = (float*)output;
     for (uint32_t f = 0; f < frameCount; f++) {
+        if (d->t % BEAT_LEN == 0)
+            nextBeat(d, d->t);
         double v = 0;
-        for (uint32_t i = 0; i < CONCURRENT_INSTRUMENT_COUNT; i++) {
-            const uint32_t attack = audioData->noteInstruments[i].attack;
-            const uint32_t decay = audioData->noteInstruments[i].decay;
-            for (uint32_t n = 0; n < CONCURRENT_NOTE_COUNT; n++)
-                if (audioData->noteMask[i][n]) {
-                    const uint32_t sustain = audioData->notes[i][n].sustain;
-                    const uint32_t noteAmp = audioData->notes[i][n].amp;
-                    const uint32_t noteFreq = audioData->notes[i][n].freq;
-                    if (audioData->playNowNotes[i][n]) {
-                        audioData->noteTimes[i][n] = audioData->t;
-                        audioData->playNowNotes[i][n] = false;
-                    }
-                    const uint32_t nT = audioData->noteTimes[i][n];
-                    const int relNT = (int)audioData->t - nT;
-                    double attDecAmpMod;
-                    if (relNT < attack) {
-                        attDecAmpMod = (double)relNT / (double)attack;
-                    }else if (relNT > attack + sustain) {
-                        attDecAmpMod = (double)((attack + sustain + decay) - relNT) / (double)decay;
-                    } else {
-                        attDecAmpMod = 1.0;
-                    }
-
-                    v += sin(
-                             (audioData->t / (float)SAMPLE_RATE)
-                             * noteFreq * 2 * PI)
-                        * noteAmp * attDecAmpMod;
-                    unsigned int endTime
-                        = audioData->noteTimes[i][n]
-                        + audioData->notes[i][n].sustain
-                        + attack + decay;
-                    if (audioData->t >= endTime)
-                        audioData->noteMask[i][n] = false;
-                }
-        }
-        audioData->t++;
-        *out++ = v * audioData->amp;
+        v += ChannelState_sample(&d->channelState, d->t);
+        d->t++;
+        *out++ = v * d->amp;
     }
     return 0;
 }
@@ -144,27 +152,46 @@ int main()
             SAMPLE_RATE,
             256,
             callback,
-            &paStreamData),
+            &audioStreamData),
         "creating audio stream");
 
-    AudioData_init(&paStreamData);
-    paStreamData.amp = 0.1;
-    paStreamData.noteInstruments[0] = (struct Instrument) {3000, 3000};
+    ChannelState_default(&audioStreamData.channelState);
+    audioStreamData.amp = 0.5;
+    audioStreamData.t = 0;
+    ChannelFrame_init(&audioStreamData.frame);
+
+    struct ChannelMod mod;
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_FREQ, 432 };
+    audioStreamData.frame.mods[4] = createLinkedListNode(sizeof(struct ChannelMod));
+    *(struct ChannelMod*)audioStreamData.frame.mods[4]->data = mod;
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_AMP, (uint16_t)(UINT32_MAX * 0.3) };
+    audioStreamData.frame.mods[4]->next = createLinkedListNode(sizeof(struct ChannelMod));
+    *(struct ChannelMod*)audioStreamData.frame.mods[4]->next->data = mod;
+
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_AMP, 0 };
+    audioStreamData.frame.mods[8] = createLinkedListNode(sizeof(struct ChannelMod));
+    *(struct ChannelMod*)audioStreamData.frame.mods[8]->data = mod;
+
 
     handlePaError(
         Pa_StartStream(stream),
         "starting audio stream");
 
-    struct Note note1 = (struct Note) { 523, 1.0f, SAMPLE_RATE * 3 };
-    struct Note note2 = (struct Note) { 659, 1.0f, SAMPLE_RATE * 2 };
-    struct Note note3 = (struct Note) { 739, 1.0f, SAMPLE_RATE };
+    Pa_Sleep(6000);
+    /*
     Pa_Sleep(1000);
-    AudioData_playNote(&paStreamData, 0, 0, true, &note1);
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_FREQ, 432 };
+    modChannelState(&audioStreamData.channelState, &mod, audioStreamData.t);
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_AMP, (uint16_t)(UINT32_MAX * 0.5) };
+    modChannelState(&audioStreamData.channelState, &mod, audioStreamData.t);
     Pa_Sleep(1000);
-    AudioData_playNote(&paStreamData, 0, 0, true, &note2);
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_FREQ, 432 * 2 / 3 };
+    modChannelState(&audioStreamData.channelState, &mod, audioStreamData.t);
     Pa_Sleep(1000);
-    AudioData_playNote(&paStreamData, 0, 0, true, &note3);
-    Pa_Sleep(3000);
+    mod = (struct ChannelMod) { CHANNEL_MOD_TYPE_AMP, 0 };
+    modChannelState(&audioStreamData.channelState, &mod, audioStreamData.t);
+    Pa_Sleep(1000);
+    */
 
     handlePaError(
         Pa_StopStream(stream),

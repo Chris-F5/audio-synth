@@ -1,6 +1,6 @@
 CC=gcc
 
-SRC=audiosynth.c
+SRC=audiosynth.c linked_list.c
 OBJ=$(SRC:.c=.o)
 
 LDFLAGS=-lportaudio -lm
