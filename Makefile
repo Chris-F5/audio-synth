@@ -1,9 +1,9 @@
 CC=gcc
 
-SRC=audiosynth.c linked_list.c
+SRC=audiosynth.c linked_list.c audio.c
 OBJ=$(SRC:.c=.o)
 
-LDFLAGS=-lportaudio -lm
+LDFLAGS=-lportaudio -lm -lSDL2 -lSDL2main -lSDL2_ttf
 CFLAGS=-g
 
 audiosynth: $(OBJ)
