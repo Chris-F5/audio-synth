@@ -29,6 +29,10 @@ struct AudioStreamData {
 
 static PaStream* paStream;
 
+static const uint16_t modValueFreq[] = {
+    262, 277, 294, 311, 330, 349, 370, 392, 415, 440, 466, 494
+};
+
 void ChannelFrame_init(
     struct ChannelFrame* frame,
     uint32_t len,
@@ -68,10 +72,10 @@ static void modChannelState(struct ChannelState* state, struct ChannelMod* mod)
     case CHANNEL_MOD_TYPE_NOOP:
         break;
     case CHANNEL_MOD_TYPE_FREQ:
-        state->freq = mod->value;
+        state->freq = modValueFreq[mod->value];
         break;
     case CHANNEL_MOD_TYPE_AMP:
-        state->tAmp = (double)mod->value / (double)UINT16_MAX;
+        state->tAmp = (double)mod->value / (double)UINT8_MAX;
         break;
     default:
         break;

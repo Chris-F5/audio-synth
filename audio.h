@@ -9,7 +9,7 @@
 
 struct ChannelMod {
     uint8_t type;
-    uint16_t value;
+    uint8_t value;
 };
 
 struct ChannelFrame {
